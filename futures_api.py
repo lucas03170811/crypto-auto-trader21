@@ -1,92 +1,90 @@
-from binance.um_futures import UMFutures
-from binance.error import ClientError
-import pandas as pd
 import time
-import os
-import ta
+import pandas as pd
+from binance.client import Client
+from binance.um_futures import UMFutures
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
 
-# 從環境變數中讀取 Binance API 金鑰
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+API_KEY = '你的 API KEY'
+API_SECRET = '你的 SECRET KEY'
+client = Client(api_key=API_KEY, api_secret=API_SECRET)
+um_futures = UMFutures(key=API_KEY, secret=API_SECRET)
 
-client = UMFutures(key=API_KEY, secret=API_SECRET)
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'ADAUSDT']
+INTERVAL_SHORT = '15m'
+INTERVAL_LONG = '1h'
 
-# 支援的交易對
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+POSITION_CACHE = {}
 
-# 設定止損比例（例如虧損達 20% 就止損）
-STOP_LOSS_THRESHOLD = -0.20
+def get_klines(symbol, interval, limit=100):
+    data = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close',
+                                     'volume', 'close_time', 'quote_asset_volume',
+                                     'number_of_trades', 'taker_buy_base',
+                                     'taker_buy_quote', 'ignore'])
+    df['close'] = pd.to_numeric(df['close'])
+    return df
 
-# 取得技術指標：RSI + 成交量
-def get_technical_indicators(symbol, interval="1m", limit=100):
-    try:
-        klines = client.klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "number_of_trades",
-            "taker_buy_base", "taker_buy_quote", "ignore"
-        ])
-        df["close"] = pd.to_numeric(df["close"])
-        df["volume"] = pd.to_numeric(df["volume"])
-        df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-        return df
-    except Exception as e:
-        print(f"[{symbol}] 取得指標失敗: {e}")
-        return None
+def get_trend_signal(symbol):
+    short_df = get_klines(symbol, INTERVAL_SHORT)
+    long_df = get_klines(symbol, INTERVAL_LONG)
 
-# 下市價單
-def place_market_order(symbol, side, quantity):
-    try:
-        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=quantity)
-        print(f"[{symbol}] 已下單 {side}，數量：{quantity}")
-        return order
-    except ClientError as e:
-        print(f"[{symbol}] 下單失敗: {e}")
-        return None
+    short_ema = EMAIndicator(short_df['close'], window=20).ema_indicator()
+    long_ema = EMAIndicator(long_df['close'], window=20).ema_indicator()
 
-# 取得持倉資訊
+    if short_df['close'].iloc[-1] > short_ema.iloc[-1] and long_df['close'].iloc[-1] > long_ema.iloc[-1]:
+        return "LONG"
+    elif short_df['close'].iloc[-1] < short_ema.iloc[-1] and long_df['close'].iloc[-1] < long_ema.iloc[-1]:
+        return "SHORT"
+    else:
+        return "NEUTRAL"
+
 def get_position(symbol):
-    try:
-        positions = client.get_position_risk()
-        for p in positions:
-            if p["symbol"] == symbol:
-                return float(p["positionAmt"]), float(p["unRealizedProfit"])
-        return 0, 0
-    except Exception as e:
-        print(f"[{symbol}] 查詢持倉錯誤: {e}")
-        return 0, 0
+    positions = um_futures.get_position_risk()
+    for pos in positions:
+        if pos['symbol'] == symbol:
+            return float(pos['positionAmt']), float(pos['entryPrice'])
+    return 0.0, 0.0
 
-# 判斷是否應進場
-def should_open_position(df):
-    if df is None or df["rsi"].isna().all():
-        return False
-    latest_rsi = df["rsi"].iloc[-1]
-    latest_vol = df["volume"].iloc[-1]
-    avg_vol = df["volume"].mean()
+def place_order(symbol, side, quantity):
+    um_futures.new_order(symbol=symbol, side=side, type='MARKET', quantity=quantity)
 
-    return latest_rsi < 30 and latest_vol > avg_vol  # 超賣且爆量
+def close_position(symbol, quantity, side):
+    reverse = 'SELL' if side == 'BUY' else 'BUY'
+    place_order(symbol, reverse, quantity)
 
-# 主邏輯
+def calculate_position_strategy(symbol):
+    position_amt, entry_price = get_position(symbol)
+    mark_price = float(um_futures.ticker_price(symbol=symbol)['price'])
+
+    if position_amt == 0:
+        return None
+
+    pnl_percent = ((mark_price - entry_price) / entry_price) * 100 if position_amt > 0 else ((entry_price - mark_price) / entry_price) * 100
+
+    if symbol not in POSITION_CACHE:
+        POSITION_CACHE[symbol] = {'entry_price': entry_price, 'max_price': entry_price}
+
+    POSITION_CACHE[symbol]['max_price'] = max(POSITION_CACHE[symbol]['max_price'], mark_price)
+    drawdown = ((POSITION_CACHE[symbol]['max_price'] - mark_price) / POSITION_CACHE[symbol]['max_price']) * 100
+
+    if pnl_percent >= 50:
+        close_position(symbol, abs(position_amt) * 0.5, 'BUY' if position_amt > 0 else 'SELL')
+
+    if drawdown >= 15:
+        close_position(symbol, abs(position_amt), 'BUY' if position_amt > 0 else 'SELL')
+
+    if pnl_percent >= 30:
+        place_order(symbol, 'BUY' if position_amt > 0 else 'SELL', abs(position_amt) * 0.5)
+
 def check_and_trade():
     for symbol in SYMBOLS:
-        print(f"分析：{symbol}")
-        df = get_technical_indicators(symbol)
+        signal = get_trend_signal(symbol)
+        position_amt, _ = get_position(symbol)
 
-        if df is None:
-            continue
+        if signal == "LONG" and position_amt <= 0:
+            place_order(symbol, "BUY", 0.01)
+        elif signal == "SHORT" and position_amt >= 0:
+            place_order(symbol, "SELL", 0.01)
 
-        qty = 0.01 if "BTC" in symbol else 1  # 根據幣種調整下單量
-        position_amt, unrealized_pnl = get_position(symbol)
-
-        if position_amt == 0:  # 沒有持倉，可開倉
-            if should_open_position(df):
-                place_market_order(symbol, side="BUY", quantity=qty)
-        else:
-            # 若持倉虧損達止損線，平倉
-            pnl_ratio = unrealized_pnl / (qty * df["close"].iloc[-1])
-            print(f"[{symbol}] 持倉損益比率：{pnl_ratio:.2%}")
-            if pnl_ratio <= STOP_LOSS_THRESHOLD:
-                side = "SELL" if position_amt > 0 else "BUY"
-                place_market_order(symbol, side=side, quantity=abs(position_amt))
-
-        time.sleep(1)  # 暫停避免 API 過度頻繁 
+        calculate_position_strategy(symbol)
