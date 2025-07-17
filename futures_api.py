@@ -1,6 +1,6 @@
 import pandas as pd
 import time
-from binance.um_futures import UMFutures
+binance-futures-connector
 from binance.error import ClientError
 import ta
 import os
